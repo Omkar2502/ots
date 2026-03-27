@@ -1,0 +1,138 @@
+/**
+ * @file Firestore Security Rules for Dispatch Dynamics
+ * @version Prototyping
+ * @description This ruleset enforces a strict user-ownership model for customers and orders,
+ * with public read access to addons. User roles (admin) are determined by the existence
+ * of a document in the /roles_admin/{uid} collection.
+ *
+ * Data Structure:
+ * - /users/{userId}/customers/{customerId}: Customer data owned by a specific user.
+ * - /users/{userId}/customers/{customerId}/orders/{orderId}: Order data associated with a customer.
+ * - /addons/{addonId}: Publicly readable add-on data.
+ * - /roles_admin/{userId}: Admin user role definitions.
+ *
+ * Key Security Decisions:
+ * - Strict user-ownership: Users can only access their own customer and order data.
+ * - Public read access to add-ons: All users can read add-on data.
+ * - Admin role: Determined by document existence in the /roles_admin/{uid} collection.
+ * - Disallowing user listing: Listing users is not permitted.
+ *
+ * Denormalization for Authorization:
+ * - Orders contain the customerId to allow direct authorization checks without needing to query the customer document.
+ *
+ * Structural Segregation:
+ * - User-specific data (customers and orders) are stored under /users/{userId} to ensure private access.
+ */
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /**
+     * @description Checks if the current user is signed in.
+     * @returns {bool} True if the user is signed in, false otherwise.
+     */
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    /**
+     * @description Checks if the current user is the owner of the resource.
+     * @param {string} userId The user ID to compare against the request's authentication UID.
+     * @returns {bool} True if the user is the owner, false otherwise.
+     */
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+        /**
+     * @description Checks if the current user is an existing owner of the resource.
+     * @param {string} userId The user ID to compare against the request's authentication UID.
+     * @returns {bool} True if the user is the owner and the resource exists, false otherwise.
+     */
+    function isExistingOwner(userId) {
+      return isOwner(userId) && resource != null;
+    }
+
+        /**
+     * @description Checks if the current user is an admin.
+     * @returns {bool} True if the user is an admin, false otherwise.
+     */
+    function isAdmin() {
+      return exists(/databases/$(database)/documents/roles_admin/$(request.auth.uid));
+    }
+
+
+    /**
+     * @description Rules for documents in the /users/{userId}/customers/{customerId}/orders/{orderId} path.
+     * @path /users/{userId}/customers/{customerId}/orders/{orderId}
+     * @allow (create) User 'omkar' with ID 'user_abc' can create an order with customerId matching the path.
+     *   request.auth.uid: 'user_abc', request.resource.data.customerId: 'customer_123'
+     * @allow (update) User 'omkar' with ID 'user_abc' can update an order they own.
+     *   request.auth.uid: 'user_abc', resource.data.customerId: 'customer_123'
+     * @deny (create) User 'sudarshan' with ID 'user_xyz' cannot create an order for another user.
+     *   request.auth.uid: 'user_xyz', request.resource.data.customerId: 'customer_123'
+     * @deny (update) User 'sudarshan' with ID 'user_xyz' cannot update an order they don't own.
+     *   request.auth.uid: 'user_xyz', resource.data.customerId: 'customer_123'
+     * @principle Enforces document ownership for writes, restricts access to a user's own data tree, validates relational integrity between documents.
+     */
+    match /users/{userId}/customers/{customerId}/orders/{orderId} {
+      allow get: if isOwner(userId);
+      allow list: if isOwner(userId);
+      allow create: if isOwner(userId) && request.resource.data.customerId == customerId;
+      allow update: if isExistingOwner(userId) && resource.data.customerId == customerId;
+      allow delete: if isExistingOwner(userId);
+    }
+
+    /**
+     * @description Rules for documents in the /users/{userId}/customers/{customerId} path.
+     * @path /users/{userId}/customers/{customerId}
+     * @allow (create) User 'omkar' with ID 'user_abc' can create a customer for themselves.
+     *   request.auth.uid: 'user_abc', request.resource.data.id: 'user_abc'
+     * @allow (update) User 'omkar' with ID 'user_abc' can update their own customer data.
+     *   request.auth.uid: 'user_abc', resource.data.id: 'user_abc'
+     * @deny (create) User 'sudarshan' with ID 'user_xyz' cannot create a customer for another user.
+     *   request.auth.uid: 'user_xyz', request.resource.data.id: 'user_abc'
+     * @deny (update) User 'sudarshan' with ID 'user_xyz' cannot update another user's customer data.
+     *   request.auth.uid: 'user_xyz', resource.data.id: 'user_abc'
+     * @principle Enforces document ownership for writes, restricts access to a user's own data tree.
+     */
+    match /users/{userId}/customers/{customerId} {
+      allow get: if isOwner(userId);
+      allow list: if isOwner(userId);
+      allow create: if isOwner(userId) && request.resource.data.id == userId;
+      allow update: if isExistingOwner(userId) && resource.data.id == userId;
+      allow delete: if isExistingOwner(userId);
+    }
+
+    /**
+     * @description Rules for documents in the /addons/{addonId} path.
+     * @path /addons/{addonId}
+     * @allow (get) Any user can read addon data.
+     *   request.auth.uid: 'user_abc'
+     * @allow (list) Any user can list addon data.
+     *   request.auth.uid: 'user_abc'
+     * @deny (create) No user can create, update, or delete addon data without proper authorization.
+     *   request.auth.uid: 'user_abc'
+     * @principle Public read access with restricted writes.
+     */
+    match /addons/{addonId} {
+      allow get: if true;
+      allow list: if true;
+      allow create: if isAdmin();
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+    
+        /**
+     * @description Rules for documents in the /roles_admin/{userId} path.
+     * @path /roles_admin/{userId}
+     */
+    match /roles_admin/{userId} {
+      allow get: if isAdmin();
+      allow list: if isAdmin();
+      allow create: if isAdmin();
+      allow update: if false;
+      allow delete: if isAdmin();
+    }
+  }
+}
